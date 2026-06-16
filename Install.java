@@ -122,7 +122,16 @@ public class Install extends HttpServlet {
         jdbcdriver = request.getParameter("jdbcdriver");
         dbuser = request.getParameter("dbuser");
         dbpass = request.getParameter("dbpass");
-        dbname = request.getParameter("dbname");
+        // Validate dbname: only allow alphanumeric characters and underscores
+        // to prevent SQL injection in DDL statements where parameterized queries
+        // cannot be used for identifiers (CREATE DATABASE, DROP DATABASE, etc.).
+        String rawDbname = request.getParameter("dbname");
+        if (rawDbname == null || !rawDbname.matches("[A-Za-z0-9_]+")) {
+            response.sendError(HttpServletResponse.SC_BAD_REQUEST,
+                    "Invalid database name. Only letters, digits, and underscores are allowed.");
+            return;
+        }
+        dbname = rawDbname;
         siteTitle= request.getParameter("siteTitle");
         adminuser= request.getParameter("adminuser");
         adminpass= HashMe.hashMe(request.getParameter("adminpass"));
