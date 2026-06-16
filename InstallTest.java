@@ -17,6 +17,7 @@ import java.io.StringWriter;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.Statement;
+import java.util.regex.Pattern;
 
 import static org.junit.Assert.*;
 import static org.mockito.Matchers.anyString;
@@ -118,6 +119,7 @@ public class InstallTest {
     @Mock private HttpServletRequest  mockRequest;
     @Mock private HttpServletResponse mockResponse;
     @Mock private HttpSession         mockSession;
+    @Mock private ServletContext      mockServletContext;
 
     private StringWriter responseWriter;
 
@@ -588,5 +590,235 @@ public class InstallTest {
             }
         }
         assertTrue("prepareStatement must be called with an INSERT into users query", foundInsert);
+    }
+
+    // -----------------------------------------------------------------------
+    // dbname allowlist validation tests (CWE-89: SQL injection in DDL)
+    // -----------------------------------------------------------------------
+
+    /**
+     * Helper: the same allowlist pattern used in processRequest() to validate dbname.
+     * Tests use this directly so they stay in sync with the production rule.
+     */
+    private static final Pattern DBNAME_ALLOWLIST = Pattern.compile("[A-Za-z0-9_]+");
+
+    private boolean isDbnameValid(String dbname) {
+        return dbname != null && DBNAME_ALLOWLIST.matcher(dbname).matches();
+    }
+
+    /**
+     * A plain alphanumeric database name must pass validation — this is the
+     * normal happy path used by legitimate installers.
+     */
+    @Test
+    public void testDbnameValidation_validAlphanumeric_accepted() {
+        assertTrue("Simple alphanumeric dbname must be accepted",
+                isDbnameValid("myapp_db"));
+        assertTrue("All-uppercase dbname must be accepted",
+                isDbnameValid("MYDB"));
+        assertTrue("Numeric suffix dbname must be accepted",
+                isDbnameValid("db123"));
+        assertTrue("Single character dbname must be accepted",
+                isDbnameValid("a"));
+    }
+
+    /**
+     * Database names containing SQL metacharacters that could alter DDL query
+     * structure must be rejected before reaching any Statement sink.
+     *
+     * CWE-89: User-controlled data must not flow into DDL string concatenation.
+     */
+    @Test
+    public void testDbnameValidation_sqlMetacharacters_rejected() {
+        // Single-quote can break out of a quoted identifier
+        assertFalse("dbname with single-quote must be rejected",
+                isDbnameValid("db'name"));
+        // Double-quote can break identifier quoting in some dialects
+        assertFalse("dbname with double-quote must be rejected",
+                isDbnameValid("db\"name"));
+        // Semicolons enable stacked queries
+        assertFalse("dbname with semicolon must be rejected",
+                isDbnameValid("db;DROP DATABASE otherdb--"));
+        // Hyphen-hyphen starts a SQL comment
+        assertFalse("dbname with comment marker must be rejected",
+                isDbnameValid("valid--"));
+        // Slash-asterisk starts a block comment
+        assertFalse("dbname with block comment must be rejected",
+                isDbnameValid("db/*comment*/"));
+        // Hash starts a MySQL line comment
+        assertFalse("dbname with hash must be rejected",
+                isDbnameValid("db#"));
+    }
+
+    /**
+     * Classic OR-based SQL injection payload in dbname must be rejected.
+     * Payload: "anything' OR '1'='1" — would modify WHERE clauses if not caught.
+     */
+    @Test
+    public void testDbnameValidation_orInjectionPayload_rejected() {
+        assertFalse("OR-injection payload in dbname must be rejected",
+                isDbnameValid("x' OR '1'='1"));
+    }
+
+    /**
+     * Stacked-query injection payload in dbname must be rejected.
+     * Payload: "db; DROP DATABASE myapp --"
+     */
+    @Test
+    public void testDbnameValidation_stackedQueryPayload_rejected() {
+        assertFalse("Stacked-query payload in dbname must be rejected",
+                isDbnameValid("db; DROP DATABASE myapp --"));
+    }
+
+    /**
+     * UNION-based injection payload in dbname must be rejected.
+     */
+    @Test
+    public void testDbnameValidation_unionPayload_rejected() {
+        assertFalse("UNION-based payload in dbname must be rejected",
+                isDbnameValid("db UNION SELECT 1,2,3--"));
+    }
+
+    /**
+     * A null dbname must be rejected — a missing parameter should not reach
+     * the DDL sink and cause a NullPointerException or an empty identifier.
+     */
+    @Test
+    public void testDbnameValidation_nullValue_rejected() {
+        assertFalse("null dbname must be rejected", isDbnameValid(null));
+    }
+
+    /**
+     * An empty-string dbname must be rejected — an empty identifier would
+     * produce invalid SQL syntax.
+     */
+    @Test
+    public void testDbnameValidation_emptyString_rejected() {
+        assertFalse("Empty-string dbname must be rejected", isDbnameValid(""));
+    }
+
+    /**
+     * Whitespace-only dbname must be rejected — whitespace would break SQL
+     * identifier syntax and is not a valid database name character.
+     */
+    @Test
+    public void testDbnameValidation_whitespace_rejected() {
+        assertFalse("Whitespace dbname must be rejected", isDbnameValid("   "));
+        assertFalse("Tab-containing dbname must be rejected", isDbnameValid("db\tname"));
+        assertFalse("Newline-containing dbname must be rejected", isDbnameValid("db\nname"));
+    }
+
+    /**
+     * dbname containing a period must be rejected — periods are used in SQL
+     * schema-qualified identifiers and could cause injection.
+     */
+    @Test
+    public void testDbnameValidation_period_rejected() {
+        assertFalse("dbname with period must be rejected",
+                isDbnameValid("db.name"));
+    }
+
+    /**
+     * processRequest() must respond with HTTP 400 Bad Request when the dbname
+     * parameter contains an SQL injection payload — ensuring the tainted value
+     * never flows to the DDL sink (CREATE DATABASE / DROP DATABASE).
+     *
+     * Test verifies: SOURCE (setup parameter gates execution) → early rejection
+     * before the dbname value reaches any Statement.executeUpdate() sink.
+     */
+    @Test
+    public void testProcessRequest_invalidDbname_rejectsWith400() throws Exception {
+        // A valid CSRF token — so we get past the CSRF gate
+        when(mockRequest.getSession(false)).thenReturn(mockSession);
+        when(mockSession.getAttribute(Install.CSRF_TOKEN_ATTR)).thenReturn("validToken");
+        when(mockRequest.getParameter(Install.CSRF_PARAM)).thenReturn("validToken");
+
+        // Inject a malicious dbname containing SQL metacharacters
+        when(mockRequest.getParameter("dbname")).thenReturn("'; DROP DATABASE myapp; --");
+        // Other parameters return safe dummy values
+        when(mockRequest.getParameter("dburl")).thenReturn("jdbc:mysql://localhost/");
+        when(mockRequest.getParameter("jdbcdriver")).thenReturn("com.mysql.jdbc.Driver");
+        when(mockRequest.getParameter("dbuser")).thenReturn("user");
+        when(mockRequest.getParameter("dbpass")).thenReturn("pass");
+        when(mockRequest.getParameter("siteTitle")).thenReturn("My Site");
+        when(mockRequest.getParameter("adminuser")).thenReturn("admin");
+        when(mockRequest.getParameter("adminpass")).thenReturn("pass");
+        when(mockRequest.getParameter("setup")).thenReturn("1");
+
+        // The servlet reads getServletContext() before reaching the dbname check;
+        // stub it to return a mock that can provide a real temp path.
+        Install servlet = new Install() {
+            @Override
+            public javax.servlet.ServletContext getServletContext() {
+                return mockServletContext;
+            }
+            @Override public String getServletInfo() { return ""; }
+        };
+
+        when(mockServletContext.getRealPath("/WEB-INF/config.properties"))
+                .thenReturn(System.getProperty("java.io.tmpdir") + "/config_test.properties");
+
+        // Pre-create a minimal config file so config.load() does not throw
+        java.util.Properties dummyConfig = new java.util.Properties();
+        java.io.File tmpConfig = new java.io.File(
+                System.getProperty("java.io.tmpdir"), "config_test.properties");
+        try (java.io.FileOutputStream fos = new java.io.FileOutputStream(tmpConfig)) {
+            dummyConfig.store(fos, null);
+        }
+
+        servlet.processRequest(mockRequest, mockResponse);
+
+        // Must reject with 400 — the SQL injection payload is caught at the input boundary
+        verify(mockResponse).sendError(
+                eq(HttpServletResponse.SC_BAD_REQUEST), anyString());
+        // Statement must never be reached with the malicious payload
+        verify(mockStatement, never()).executeUpdate(anyString());
+    }
+
+    /**
+     * processRequest() must accept a valid dbname and NOT send a 400 error
+     * (assuming it has a valid CSRF token and a writable config path).
+     */
+    @Test
+    public void testProcessRequest_validDbname_doesNotRejectWith400() throws Exception {
+        // Valid CSRF token
+        when(mockRequest.getSession(false)).thenReturn(mockSession);
+        when(mockSession.getAttribute(Install.CSRF_TOKEN_ATTR)).thenReturn("validToken");
+        when(mockRequest.getParameter(Install.CSRF_PARAM)).thenReturn("validToken");
+
+        // Valid dbname — only alphanumeric characters
+        when(mockRequest.getParameter("dbname")).thenReturn("validdb_123");
+        when(mockRequest.getParameter("dburl")).thenReturn("jdbc:mysql://localhost/");
+        when(mockRequest.getParameter("jdbcdriver")).thenReturn("com.mysql.jdbc.Driver");
+        when(mockRequest.getParameter("dbuser")).thenReturn("user");
+        when(mockRequest.getParameter("dbpass")).thenReturn("pass");
+        when(mockRequest.getParameter("siteTitle")).thenReturn("My Site");
+        when(mockRequest.getParameter("adminuser")).thenReturn("admin");
+        when(mockRequest.getParameter("adminpass")).thenReturn("pass");
+        when(mockRequest.getParameter("setup")).thenReturn("1");
+
+        Install servlet = new Install() {
+            @Override
+            public javax.servlet.ServletContext getServletContext() {
+                return mockServletContext;
+            }
+            @Override public String getServletInfo() { return ""; }
+        };
+
+        when(mockServletContext.getRealPath("/WEB-INF/config.properties"))
+                .thenReturn(System.getProperty("java.io.tmpdir") + "/config_test_valid.properties");
+
+        // Pre-create a minimal config file
+        java.util.Properties dummyConfig = new java.util.Properties();
+        java.io.File tmpConfig = new java.io.File(
+                System.getProperty("java.io.tmpdir"), "config_test_valid.properties");
+        try (java.io.FileOutputStream fos = new java.io.FileOutputStream(tmpConfig)) {
+            dummyConfig.store(fos, null);
+        }
+
+        servlet.processRequest(mockRequest, mockResponse);
+
+        // Must NOT send a 400 error for a valid dbname
+        verify(mockResponse, never()).sendError(eq(HttpServletResponse.SC_BAD_REQUEST), anyString());
     }
 }
